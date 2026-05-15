@@ -562,3 +562,24 @@
   - 将中英文文档进一步统一为：
     - `LLM_PROVIDER=glm` -> 填 `GLM_API_KEY`，无需新建并填写 `GEMINI_API_KEY`
     - `LLM_PROVIDER=gemini` -> 填 `GEMINI_API_KEY`，无需新建并填写 `GLM_API_KEY`
+
+### 2026-05-09 登录验证码通过后又跳转隐私政策页时的认证稳态校验
+
+- 现象：
+  - 某些运行日志里，hCaptcha 已经成功通过，随后日志显示 `Login success` / `Right account validation success`。
+  - 但新开的领取页稍后又被重定向到 `/id/login/correction/privacy-policy`，最终以 `Could not determine Epic login state because //egs-navigation did not appear` 失败。
+  - Celery 调度入口即使认证失败，也没有像主入口那样立即中止任务。
+- 根因判断：
+  - 认证服务此前把“登录阶段收到成功信号”当成了“整个 Epic 商店会话已经可用于领取”，缺少登录后对领取页可用性的稳态确认。
+  - 领取前状态检查只做了一次性判断，没有覆盖延迟发生的 `privacy-policy correction` 重定向。
+  - `app/schedule/collect_epic_games_task.py` 没有校验 `agent.invoke()` 的返回值，认证失败后仍可能继续执行后续领取逻辑。
+- 改动文件：
+  - `app/services/epic_authorization_service.py`
+  - `app/services/epic_games_service.py`
+  - `app/schedule/collect_epic_games_task.py`
+  - `docs/maintenance-log.md`
+- 处理结果：
+  - 登录成功后会主动跳转一次周免页，并等待 `isloggedin=true`，只有真正拿到可用商店会话才继续后续流程。
+  - 对延迟出现的 `/id/login/correction/privacy-policy` 重定向改为显式识别，给出明确的人工确认提示，不再落成泛化的 `//egs-navigation` 超时异常。
+  - 领取页登录态检查改成短轮询稳态等待，避免刚跳转时的瞬时中间页被误判成未知异常。
+  - Celery 调度入口与主入口统一：认证失败会立即终止，而不是继续进入领取阶段。

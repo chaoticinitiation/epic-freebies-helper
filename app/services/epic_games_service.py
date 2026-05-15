@@ -21,6 +21,7 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt
 
 from models import OrderItem, Order
 from models import PromotionGame
+from services.epic_authorization_service import EpicManualActionRequiredError
 from settings import settings, RUNTIME_DIR
 
 URL_CLAIM = "https://store.epicgames.com/en-US/free-games"
@@ -119,18 +120,48 @@ class EpicAgent:
     def _needs_privacy_policy_correction(self) -> bool:
         return "/id/login/correction/privacy-policy" in self.page.url
 
-    async def _get_login_status(self) -> str | None:
+    @staticmethod
+    def _privacy_policy_confirmation_message(current_url: str) -> str:
+        return (
+            "Epic account requires a manual privacy-policy confirmation. "
+            "Please sign in once in a normal browser, complete the confirmation page, "
+            f"and rerun the workflow. current_url={current_url}"
+        )
+
+    async def _get_login_status(self, timeout_ms: int = 30000) -> str | None:
         if self._needs_privacy_policy_correction():
             return None
 
         try:
-            return await self.page.locator("//egs-navigation").get_attribute("isloggedin")
+            return await self.page.locator("//egs-navigation").get_attribute(
+                "isloggedin", timeout=timeout_ms
+            )
         except PlaywrightTimeoutError:
             logger.warning(
                 "Timed out while waiting for //egs-navigation on claim page | current_url='{}'",
                 self.page.url,
             )
             return None
+
+    async def _wait_for_claim_page_login_state(self, timeout_seconds: int = 45) -> str:
+        deadline = time.monotonic() + timeout_seconds
+
+        while time.monotonic() < deadline:
+            if self._needs_privacy_policy_correction():
+                raise EpicManualActionRequiredError(
+                    self._privacy_policy_confirmation_message(self.page.url)
+                )
+
+            status = await self._get_login_status(timeout_ms=1500)
+            if status in {"true", "false"}:
+                return status
+
+            await self.page.wait_for_timeout(500)
+
+        raise RuntimeError(
+            "Could not determine Epic login state because //egs-navigation did not appear. "
+            f"current_url={self.page.url}"
+        )
 
     async def _sync_order_history(self):
         if self._orders:
@@ -169,21 +200,14 @@ class EpicAgent:
         await self.page.goto(URL_CLAIM, wait_until="domcontentloaded")
 
         if self._needs_privacy_policy_correction():
-            raise RuntimeError(
-                "Epic account requires a manual privacy-policy confirmation. "
-                "Please sign in once in a normal browser, complete the confirmation page, "
-                "and rerun the workflow."
+            raise EpicManualActionRequiredError(
+                self._privacy_policy_confirmation_message(self.page.url)
             )
 
-        status = await self._get_login_status()
+        status = await self._wait_for_claim_page_login_state()
         if status == "false":
             logger.error("❌ context cookies is not available")
             return False
-        if status is None:
-            raise RuntimeError(
-                f"Could not determine Epic login state because //egs-navigation did not appear. "
-                f"current_url={self.page.url}"
-            )
         self._ctx_cookies_is_available = True
         await self._check_orders()
         if not self._promotions:

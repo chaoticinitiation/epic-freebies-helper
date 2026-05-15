@@ -27,6 +27,10 @@ class EpicAuthenticationFatalError(RuntimeError):
     pass
 
 
+class EpicManualActionRequiredError(RuntimeError):
+    pass
+
+
 class EpicAuthorization:
 
     def __init__(self, page: Page):
@@ -88,6 +92,14 @@ class EpicAuthorization:
 
     def _needs_privacy_policy_correction(self) -> bool:
         return "/id/login/correction/privacy-policy" in self.page.url
+
+    @staticmethod
+    def _privacy_policy_confirmation_message(current_url: str) -> str:
+        return (
+            "Epic account requires a manual privacy-policy confirmation. "
+            "Please sign in once in a normal browser, complete the confirmation page, "
+            f"and rerun the workflow. current_url={current_url}"
+        )
 
     async def _page_body_text(self) -> str:
         with suppress(Exception):
@@ -218,18 +230,45 @@ class EpicAuthorization:
         with suppress(Exception):
             await old_page.close()
 
-    async def _get_login_status(self) -> str | None:
+    async def _get_login_status(self, timeout_ms: int = 30000) -> str | None:
         if self._needs_privacy_policy_correction():
             return None
 
         try:
-            return await self.page.locator("//egs-navigation").get_attribute("isloggedin")
+            return await self.page.locator("//egs-navigation").get_attribute(
+                "isloggedin", timeout=timeout_ms
+            )
         except PlaywrightTimeoutError:
             logger.warning(
                 "Timed out while waiting for //egs-navigation during auth check | current_url='{}'",
                 self.page.url,
             )
             return None
+
+    async def _ensure_store_session_ready(self, timeout_seconds: int = 45) -> None:
+        deadline = time.monotonic() + timeout_seconds
+
+        while time.monotonic() < deadline:
+            if self._needs_privacy_policy_correction():
+                raise EpicManualActionRequiredError(
+                    self._privacy_policy_confirmation_message(self.page.url)
+                )
+
+            status = await self._get_login_status(timeout_ms=1500)
+            if status == "true":
+                return
+            if status == "false":
+                raise RuntimeError(
+                    "Epic store still reports isloggedin=false after authentication. "
+                    f"current_url={self.page.url}"
+                )
+
+            await self.page.wait_for_timeout(500)
+
+        raise RuntimeError(
+            "Could not verify Epic store access after authentication. "
+            f"current_url={self.page.url}"
+        )
 
     async def _login(self) -> bool | None:
         # 尽可能早地初始化机器人
@@ -288,6 +327,9 @@ class EpicAuthorization:
 
             await asyncio.wait_for(self._handle_right_account_validation(), timeout=60)
             logger.success("Right account validation success")
+            await self.page.goto(URL_CLAIM, wait_until="domcontentloaded")
+            await self._ensure_store_session_ready()
+            logger.success("Epic store session verification success")
             return True
         except Exception as err:
             logger.warning(f"Login attempt failed: {err!r}")
@@ -299,6 +341,9 @@ class EpicAuthorization:
                     "Epic account requires two-factor authentication, which is not supported by this project. "
                     "Disable Epic 2FA (email / SMS / authenticator) and rerun the workflow."
                 )
+                raise
+            if isinstance(err, EpicManualActionRequiredError):
+                logger.error(str(err))
                 raise
             return None
 
@@ -322,6 +367,8 @@ class EpicAuthorization:
             try:
                 if await self._login():
                     return True
+            except EpicManualActionRequiredError:
+                raise
             except EpicAuthenticationFatalError:
                 logger.error("Authentication aborted because Epic 2FA is still enabled")
                 return False
